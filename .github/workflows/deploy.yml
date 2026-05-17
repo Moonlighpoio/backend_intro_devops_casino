@@ -1,0 +1,79 @@
+name: CI/CD Backend Deployment
+
+on:
+  push:
+    branches: [ "deploy" ] # Restricción obligatoria de la pauta
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag and Push Image to ECR
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          ECR_REPOSITORY: casino-backend
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Cumplimiento estricto: Se compila inyectando las 3 tags exigidas por el profesor
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest -t $Ecr_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:v1.0.0 .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:v1.0.0
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH Remote Deployment to AWS EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_BACKEND_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Autenticar Docker dentro de la máquina EC2 remota
+            aws Ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+            
+            # Crear red virtual de aislamiento si no existe
+            docker network create casino-network || true
+            
+            # Levantar contenedor Postgres Base de Datos (aislada internamente)
+            if [ ! "$(docker ps -a -q -f name=casino-db)" ]; then
+              docker run -d --name casino-db --network casino-network --restart always \
+                -e POSTGRES_DB=casino \
+                -e POSTGRES_USER=postgres \
+                -e POSTGRES_PASSWORD=postgres \
+                postgres:15-alpine
+            fi
+            
+            # Descargar la nueva versión construida por Actions
+            docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/casino-backend:latest
+            
+            # Detener y limpiar versiones previas sin tumbar la máquina
+            docker stop casino-backend-prod || true
+            docker rm casino-backend-prod || true
+            
+            # Lanzar la API del casino en el puerto 3000 conectado a la base de datos
+            docker run -d --name casino-backend-prod --network casino-network --restart always \
+              -p 3000:3000 \
+              -e DB_HOST=casino-db \
+              -e DB_USER=postgres \
+              -e DB_PASSWORD=postgres \
+              -e DB_NAME=casino \
+              -e PORT=3000 \
+              ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/casino-backend:latest
